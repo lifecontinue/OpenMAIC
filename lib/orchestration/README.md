@@ -14,7 +14,7 @@ START → director ──(shouldEnd)──→ END
               └──(next)──→ agent_generate → END
 ```
 
-入口：`createOrchestrationGraph()` / `buildInitialState()`（`lib/orchestration/director-graph.ts`），由 `lib/orchestration/stateless-generate.ts` 调用。节点通过 LangGraph custom stream 的 `config.writer()` 推 `StatelessEvent`（`thinking`、`cue_user`、`agent_start`、`text_delta`、`action`、`agent_end`），供 SSE 下发。
+入口：`createOrchestrationGraph()` / `buildInitialState()`（`lib/orchestration/director-graph.ts`），由 `lib/orchestration/stateless-generate.ts` 调用。节点通过 LangGraph custom stream 的 `config.writer()` 推聊天事件（`thinking`、`cue_user`、`agent_start`、`text_delta`、`agent_end`），供 SSE 下发。一次发言就是一段口播文本。
 
 ## 状态
 
@@ -29,7 +29,7 @@ START → director ──(shouldEnd)──→ END
 | `discussionContext` | `discussionTopic` / `discussionPrompt` | 有则进入讨论模式 |
 | `triggerAgentId` | `config.triggerAgentId` | 第 0 轮快路径发言人 |
 | `userProfile` | 请求 | 学生昵称与背景 |
-| `turnCount` / `agentResponses` / `whiteboardLedger` | `directorState` | 客户端带回的跨请求进度 |
+| `turnCount` / `agentResponses` | `directorState` | 客户端带回的跨请求进度 |
 | `currentAgentId` / `shouldEnd` | 导演节点 | 路由 |
 
 智能体解析顺序：请求级 override，然后全局 `useAgentRegistry`。
@@ -46,7 +46,7 @@ START → director ──(shouldEnd)──→ END
 **多智能体**
 
 1. `turnCount === 0` 且 `triggerAgentId` 在可选列表中：直接派发该智能体。
-2. 否则调模型。系统提示由 `buildDirectorPrompt` 拼出（模板 `lib/prompts/templates/director/system.md`），输入包括智能体名单（id、name、role、priority）、已发言摘要、对话压缩、白板账本、学生档案、白板开合。
+2. 否则调模型。系统提示由 `buildDirectorPrompt` 拼出（模板 `lib/prompts/templates/director/system.md`），输入包括智能体名单（id、name、role、priority）、已发言摘要、对话压缩、学生档案。
 3. `parseDirectorDecision` 得到下一发言人：
    - `END` 或空 id：结束。
    - `USER`：`cue_user` 后结束。
@@ -58,24 +58,18 @@ START → director ──(shouldEnd)──→ END
 
 ## 智能体生成
 
-`agent_generate` 只处理导演选出的一个 id。
+`agent_generate` 只处理导演选出的一个 id，产出是一段聊天发言。
 
-1. 按当前场景类型用 `getEffectiveActions` 收窄 `allowedActions`（例如非幻灯片场景去掉聚光灯 / 激光笔）。
-2. `buildStructuredPrompt` 组装该角色的系统提示（人格、场景、白板账本、同伴本轮发言、学生档案）。角色细则与篇幅目标仍在 `prompt-builder.ts`，尚未全部下沉到 markdown 模板。
-3. 历史经 `convertMessagesToOpenAI` 映射：其他智能体的发言对当前智能体视为 user，避免模型把自己和别人混成同一条 assistant。
-4. 消息列表必须以 `HumanMessage` 结尾；否则补一条开场或“轮到你发言”的提示。
-5. 流式输出经 `parseStructuredChunk` 拆成口播文本和动作。白板动作记入 `WhiteboardActionRecord`（绘制、公式、表格、代码、清空白板等），随本轮 `AgentTurnSummary` 返回，供下一请求的导演和同伴上下文使用。
+1. `buildStructuredPrompt` 组装该角色的系统提示（人格、同伴本轮发言、学生档案）。角色细则与篇幅目标仍在 `prompt-builder.ts`。
+2. 历史经 `convertMessagesToOpenAI` 映射：其他智能体的发言对当前智能体视为 user，避免模型把自己和别人混成同一条 assistant。
+3. 消息列表必须以 `HumanMessage` 结尾；否则补一条开场或“轮到你发言”的提示。
+4. 流式文本写入 `text_delta`。本轮摘要（谁说了什么）随 `AgentTurnSummary` 返回，供下一请求的导演和同伴上下文使用。
 
-## 角色与动作
+结构化 action 不是这条编排的主体。OpenMAIC 代码里还留着白板、聚光灯等类型，prototype 的对话不使用那一套，文档不把它们算进动作面。
 
-`AgentConfig`（`lib/orchestration/registry/types.ts`）决定谁能做什么：`role`、`persona`、`priority`（1–10，导演排序用）、`allowedActions`、可选 TTS。
+## 角色
 
-动作分两组：
-
-- 白板：`wb_open` / `wb_close` / `wb_draw_*` / `wb_edit_code` / `wb_clear` / `wb_delete`
-- 幻灯片：`spotlight` / `laser` / `play_video`
-
-角色到默认动作集的映射以该文件中的常量为准。执行不在编排层，编排只产出动作事件，由 `lib/action/` 落地。
+`AgentConfig`（`lib/orchestration/registry/types.ts`）描述一个聊天角色：`role`、`persona`、`priority`（1–10，导演排序用）、可选 TTS。
 
 ## 和客户端的契约
 
@@ -84,7 +78,7 @@ START → director ──(shouldEnd)──→ END
 - 消息历史
 - `config.agentIds`（以及生成型智能体的 `agentConfigs`）
 - 课堂 `storeState`
-- 上一轮的 `directorState`（`turnCount`、`agentResponses`、`whiteboardLedger`）
+- 上一轮的 `directorState`（`turnCount`、`agentResponses`）
 
 一轮结束后，客户端根据事件更新 UI，若导演没有 `cue_user` 或结束，再发下一轮。
 
@@ -96,8 +90,7 @@ START → director ──(shouldEnd)──→ END
 | `lib/orchestration/director-prompt.ts` | 导演提示与决策解析 |
 | `lib/orchestration/prompt-builder.ts` | 智能体结构化提示 |
 | `lib/orchestration/stateless-generate.ts` | 请求入口与流式解析 |
-| `lib/orchestration/tool-schemas.ts` | 动作 schema 与场景过滤 |
 | `lib/orchestration/registry/` | 智能体配置与选择 |
-| `lib/orchestration/summarizers/` | 对话压缩、白板账本、同伴上下文 |
+| `lib/orchestration/summarizers/` | 对话压缩、同伴上下文 |
 | `lib/prompts/templates/director/` | 导演 markdown 模板 |
 | `lib/prompts/templates/agent-system*` | 智能体系统提示模板 |
